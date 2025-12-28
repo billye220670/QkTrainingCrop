@@ -1,0 +1,336 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Upload, ArrowRight, FolderOpen, Image as ImageIcon, CheckCircle } from 'lucide-react';
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card, CardContent } from "@/components/ui/card";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+
+const BulkCropper = () => {
+  const [files, setFiles] = useState([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [imageSrc, setImageSrc] = useState(null);
+  const [filePrefix, setFilePrefix] = useState("crop_");
+  const [isFinished, setIsFinished] = useState(false);
+  
+  // 核心状态：全部基于 1024x1024 坐标系
+  // scale: 图片相对于原始尺寸的缩放比例
+  // x, y: 图片左上角相对于画布(0,0)的偏移量
+  const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 }); // 鼠标起始位置
+  const [imgDims, setImgDims] = useState({ w: 0, h: 0 }); // 图片原始尺寸
+
+  const imageRef = useRef(null);
+
+  // 常量
+  const TARGET_SIZE = 1024;
+  const PREVIEW_SIZE = 512;
+  const VISUAL_SCALE = PREVIEW_SIZE / TARGET_SIZE; // 0.5，用于屏幕显示缩放，不影响逻辑
+
+  // 加载图片
+  useEffect(() => {
+    if (files.length > 0 && currentIndex < files.length) {
+      const file = files[currentIndex];
+      const url = URL.createObjectURL(file);
+      setImageSrc(url);
+      return () => URL.revokeObjectURL(url);
+    } else if (files.length > 0 && currentIndex >= files.length) {
+      setIsFinished(true);
+      setImageSrc(null);
+    }
+  }, [files, currentIndex]);
+
+  // 图片加载完成：计算“最短边撑满”并居中
+  const onImageLoad = (e) => {
+    const img = e.target;
+    const nw = img.naturalWidth;
+    const nh = img.naturalHeight;
+    setImgDims({ w: nw, h: nh });
+
+    // 算法：找出缩放比例，使得较短的那一边等于 TARGET_SIZE
+    // Math.max 确保如果是长方形，我们取覆盖整个盒子的那个比例
+    // 逻辑：如果 w=2000, h=1000. 1024/2000=0.5, 1024/1000=1.024. 选 1.024，这样高度撑满，宽度溢出
+    const scale = Math.max(TARGET_SIZE / nw, TARGET_SIZE / nh);
+    
+    // 居中计算
+    const renderedW = nw * scale;
+    const renderedH = nh * scale;
+    
+    const x = (TARGET_SIZE - renderedW) / 2;
+    const y = (TARGET_SIZE - renderedH) / 2;
+
+    setTransform({ x, y, scale });
+  };
+
+  // --- 交互逻辑 (鼠标事件需要除以 VISUAL_SCALE 来还原到 1024 坐标系) ---
+
+  const handleMouseDown = (e) => {
+    e.preventDefault();
+    setIsDragging(true);
+    // 记录点击时，鼠标相对于图片的偏移量
+    setDragStart({ 
+      mouseX: e.clientX, 
+      mouseY: e.clientY,
+      currentX: transform.x,
+      currentY: transform.y
+    });
+  };
+
+  const handleMouseMove = (e) => {
+    if (!isDragging) return;
+    e.preventDefault();
+    
+    // 鼠标移动的屏幕像素
+    const deltaScreenX = e.clientX - dragStart.mouseX;
+    const deltaScreenY = e.clientY - dragStart.mouseY;
+
+    // 转换为逻辑像素 (1024系统)
+    // 如果屏幕显示是 0.5倍，那么屏幕移动 1px 等于逻辑移动 2px
+    const deltaLogicX = deltaScreenX / VISUAL_SCALE;
+    const deltaLogicY = deltaScreenY / VISUAL_SCALE;
+
+    setTransform(prev => ({
+      ...prev,
+      x: dragStart.currentX + deltaLogicX,
+      y: dragStart.currentY + deltaLogicY
+    }));
+  };
+
+  const handleMouseUp = () => {
+    setIsDragging(false);
+  };
+
+  const handleWheel = (e) => {
+    e.preventDefault();
+    const zoomSensitivity = 0.001;
+    // 滚轮向下是正，我们需要缩小，所以取反
+    const delta = -e.deltaY * zoomSensitivity;
+    
+    setTransform(prev => {
+      const newScale = Math.max(0.1, prev.scale + delta);
+      
+      // 简单中心缩放补偿：
+      // 让图片相对于画布中心点进行缩放，而不是左上角
+      // 公式：NewPos = Center - (Center - OldPos) * (NewScale / OldScale)
+      const cx = TARGET_SIZE / 2;
+      const cy = TARGET_SIZE / 2;
+      const ratio = newScale / prev.scale;
+
+      const newX = cx - (cx - prev.x) * ratio;
+      const newY = cy - (cy - prev.y) * ratio;
+
+      return { x: newX, y: newY, scale: newScale };
+    });
+  };
+
+  // --- 导出逻辑 ---
+  
+  const processNext = useCallback(() => {
+    if (!imageRef.current || currentIndex >= files.length) return;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = TARGET_SIZE;
+    canvas.height = TARGET_SIZE;
+    const ctx = canvas.getContext('2d');
+
+    // 1. 填充白色背景
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, TARGET_SIZE, TARGET_SIZE);
+
+    // 2. 绘制图片
+    // drawImage(img, x, y, width, height)
+    // 这里直接使用 state 中的 x, y, scale，因为它们已经是 1024 坐标系的值了
+    // 这是最关键的一步：所见即所得
+    ctx.drawImage(
+      imageRef.current,
+      transform.x, 
+      transform.y, 
+      imgDims.w * transform.scale, 
+      imgDims.h * transform.scale
+    );
+
+    // 3. 下载
+    const fileName = `${filePrefix}${currentIndex + 1}.jpg`;
+    canvas.toBlob((blob) => {
+      const link = document.createElement('a');
+      link.download = fileName;
+      link.href = URL.createObjectURL(blob);
+      link.click();
+      
+      // 4. 下一张
+      setCurrentIndex(prev => prev + 1);
+    }, 'image/jpeg', 0.95);
+
+  }, [currentIndex, files, filePrefix, transform, imgDims]);
+
+  // 快捷键
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Enter' && !isFinished && files.length > 0) {
+        processNext();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [processNext, isFinished, files]);
+
+  // 文件夹选择
+  const handleFolderUpload = (event) => {
+    const selectedFiles = Array.from(event.target.files).filter(file => 
+      file.type.startsWith('image/')
+    );
+    if (selectedFiles.length > 0) {
+      selectedFiles.sort((a, b) => a.name.localeCompare(b.name));
+      setFiles(selectedFiles);
+      setCurrentIndex(0);
+      setIsFinished(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-slate-100 p-6 items-center overflow-hidden select-none">
+      {/* Header */}
+      <div className="w-full max-w-5xl flex justify-between items-center mb-6">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-800">1024x1024 精准裁切修复版</h1>
+          <p className="text-slate-500 text-sm">最短边自动撑满 | 所见即所得 | Enter 快速保存</p>
+        </div>
+        
+        <div className="flex items-center gap-4">
+          <Input 
+            value={filePrefix} 
+            onChange={(e) => setFilePrefix(e.target.value)} 
+            className="w-32 bg-white" 
+            placeholder="prefix_"
+          />
+          <div className="relative">
+            <input
+              type="file"
+              webkitdirectory=""
+              directory=""
+              multiple
+              onChange={handleFolderUpload}
+              className="absolute inset-0 opacity-0 cursor-pointer"
+            />
+            <Button variant="outline" className="gap-2">
+              <FolderOpen size={16} />
+              选择文件夹
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex gap-8 items-start">
+        
+        {/* 编辑区域 */}
+        <Card className="shadow-2xl border-0 overflow-hidden">
+          <CardContent className="p-0 bg-slate-800 flex items-center justify-center">
+            
+            {/* 外框：固定为预览大小 (512px) */}
+            <div 
+              style={{ width: PREVIEW_SIZE, height: PREVIEW_SIZE }}
+              className="relative overflow-hidden cursor-move"
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseUp}
+              onWheel={handleWheel}
+            >
+              {files.length === 0 ? (
+                <div className="w-full h-full flex flex-col items-center justify-center text-slate-500">
+                  <Upload size={48} className="mb-4 opacity-50" />
+                  <p>请上传文件夹</p>
+                </div>
+              ) : isFinished ? (
+                <div className="w-full h-full flex flex-col items-center justify-center text-green-500">
+                  <CheckCircle size={64} className="mb-4" />
+                  <p className="font-bold">完成</p>
+                </div>
+              ) : (
+                /* 核心修复点：这里创建一个虚拟的 1024 容器，然后缩小显示 */
+                <div 
+                  style={{
+                    width: TARGET_SIZE,
+                    height: TARGET_SIZE,
+                    transform: `scale(${VISUAL_SCALE})`, // 缩放整个画布以适应屏幕
+                    transformOrigin: '0 0', // 从左上角缩放
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    backgroundColor: '#000' // 画布背景
+                  }}
+                >
+                  {/* 图片层：直接使用逻辑坐标 (x, y, w, h) */}
+                  {imageSrc && (
+                    <img
+                      ref={imageRef}
+                      src={imageSrc}
+                      alt="Work"
+                      onLoad={onImageLoad}
+                      draggable={false}
+                      style={{
+                        position: 'absolute',
+                        left: `${transform.x}px`,
+                        top: `${transform.y}px`,
+                        width: `${imgDims.w * transform.scale}px`,
+                        height: `${imgDims.h * transform.scale}px`,
+                        maxWidth: 'none', // 防止 CSS 干扰
+                        maxHeight: 'none',
+                        userSelect: 'none',
+                        pointerEvents: 'none' // 让鼠标事件透传给容器
+                      }}
+                    />
+                  )}
+                  
+                  {/* 网格线 (辅助线也是 1024 尺寸的) */}
+                  <div className="absolute inset-0 border-2 border-green-500/50 pointer-events-none z-50">
+                     <div className="w-full h-full grid grid-cols-2 grid-rows-2">
+                        <div className="border-r border-b border-green-500/20"></div>
+                        <div className="border-b border-green-500/20"></div>
+                        <div className="border-r border-green-500/20"></div>
+                     </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 控制面板 */}
+        <div className="w-64 space-y-4">
+          <Card>
+            <CardContent className="p-4 space-y-4">
+              <div className="flex justify-between items-center text-sm">
+                <span className="text-slate-500">进度</span>
+                <span className="font-mono font-bold">
+                  {files.length > 0 ? currentIndex + 1 : 0} / {files.length}
+                </span>
+              </div>
+              
+              <Button 
+                onClick={processNext} 
+                disabled={files.length === 0 || isFinished}
+                className="w-full h-12 bg-blue-600 hover:bg-blue-700 font-bold text-lg"
+              >
+                下一张 (Enter)
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Alert className="bg-white border-slate-200">
+            <ImageIcon className="h-4 w-4" />
+            <AlertDescription className="text-xs text-slate-600 mt-1">
+              当前逻辑：
+              <br/>
+              1. 无论图片多大，最短边自动撑满 1024。
+              <br/>
+              2. 绿色边框内即为最终下载内容。
+            </AlertDescription>
+          </Alert>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default BulkCropper;
